@@ -1,21 +1,21 @@
 import sys
 import argparse
 import urllib.request
-import re
+import json
 from typing import Dict, Set, List
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Инструмент визуализации графа зависимостей (Этап 3)")
     parser.add_argument("--package", "-p", required=True, help="Имя анализируемого пакета")
-    parser.add_argument("--repo", "-r", required=True, help="URL репозитория или путь к файлу")
+    parser.add_argument("--repo", "-r", help="Путь к файлу тестового репозитория")
     parser.add_argument("--mode", "-m", choices=["real", "test"], default="real", help="Режим работы")
     parser.add_argument("--depth", "-d", type=int, default=10, help="Максимальная глубина анализа")
     return parser.parse_args()
 
 
 def load_test_repo(file_path: str) -> Dict[str, List[str]]:
-    """Загрузить тестовый граф из файла"""
+    """тестовый граф из файла"""
     graph = {}
     try:
         with open(file_path, 'r', encoding='utf-8') as f:
@@ -39,54 +39,46 @@ def load_test_repo(file_path: str) -> Dict[str, List[str]]:
     return graph
 
 
-def get_cargo_toml(repo_url: str) -> str:
-    """Получить Cargo.toml из репозитория"""
-    if "github.com" in repo_url:
-        repo_url = repo_url.rstrip("/")
-        raw_url = repo_url.replace("github.com", "raw.githubusercontent.com")
+def get_dependencies_from_crates_io(package_name: str) -> List[str]:
+    """Получить зависимости пакета через crates.io API"""
+    versions_url = f"https://crates.io/api/v1/crates/{package_name}/versions"
 
-        urls = [
-            f"{raw_url}/main/Cargo.toml",
-            f"{raw_url}/master/Cargo.toml",
-        ]
+    try:
+        req = urllib.request.Request(versions_url)
+        req.add_header('User-Agent', 'dependency-visualizer')
 
-        for url in urls:
-            try:
-                with urllib.request.urlopen(url) as response:
-                    return response.read().decode('utf-8')
-            except:
-                continue
+        with urllib.request.urlopen(req, timeout=10) as response:
+            data = json.loads(response.read().decode('utf-8'))
 
-    raise Exception("Не удалось получить Cargo.toml")
+        versions = data.get('versions', [])
+        if not versions:
+            return []
 
+        latest_version = versions[0]
+        version_num = latest_version['num']
 
-def parse_dependencies(cargo_toml: str) -> List[str]:
-    """Извлечь зависимости из Cargo.toml"""
-    deps = []
-    in_deps = False
+        deps_url = f"https://crates.io/api/v1/crates/{package_name}/{version_num}/dependencies"
+        req_deps = urllib.request.Request(deps_url)
+        req_deps.add_header('User-Agent', 'dependency-visualizer')
 
-    for line in cargo_toml.split('\n'):
-        line = line.strip()
+        with urllib.request.urlopen(req_deps, timeout=10) as response:
+            deps_data = json.loads(response.read().decode('utf-8'))
 
-        if line == '[dependencies]':
-            in_deps = True
-            continue
+        dependencies = []
+        for dep in deps_data.get('dependencies', []):
+            if dep.get('kind') == 'normal':
+                dependencies.append(dep['crate_id'])
 
-        if line.startswith('[') and in_deps:
-            break
+        return dependencies
 
-        if in_deps and line and not line.startswith('#'):
-            match = re.match(r'^([a-zA-Z0-9_-]+)\s*=', line)
-            if match:
-                deps.append(match.group(1))
-
-    return deps
-
-
-def get_dependencies_real(package: str, repo_url: str) -> List[str]:
-    """Получить зависимости из реального репозитория"""
-    cargo_content = get_cargo_toml(repo_url)
-    return parse_dependencies(cargo_content)
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return []
+        else:
+            raise Exception(f"HTTP ошибка для {package_name}: {e.code}")
+    except Exception as e:
+        print(f"Предупреждение: не удалось получить зависимости для {package_name}: {e}")
+        return []
 
 
 class DependencyGraph:
@@ -94,6 +86,7 @@ class DependencyGraph:
         self.mode = mode
         self.repo = repo
         self.max_depth = max_depth
+
         self.graph: Dict[str, Set[str]] = {}
         self.visited: Set[str] = set()
         self.in_progress: Set[str] = set()
@@ -107,10 +100,7 @@ class DependencyGraph:
         if self.mode == "test":
             return self.test_graph.get(package, [])
         else:
-            try:
-                return get_dependencies_real(package, self.repo)
-            except:
-                return []
+            return get_dependencies_from_crates_io(package)
 
     def dfs(self, package: str, depth: int, path: List[str]):
         """DFS для построения графа зависимостей"""
@@ -118,7 +108,6 @@ class DependencyGraph:
             return
 
         if package in self.in_progress:
-            # Обнаружен цикл
             cycle_start = path.index(package)
             cycle = path[cycle_start:] + [package]
             self.cycles.append(cycle)
@@ -130,7 +119,6 @@ class DependencyGraph:
         self.in_progress.add(package)
         path.append(package)
 
-        # Получаем зависимости
         deps = self.get_deps(package)
 
         if package not in self.graph:
@@ -175,19 +163,22 @@ def main():
         if args.depth < 0:
             raise ValueError("Глубина должна быть >= 0")
 
+        if args.mode == "test" and not args.repo:
+            raise ValueError("В тестовом режиме необходимо указать --repo с путем к файлу")
+
         print(f"Пакет: {args.package}")
         print(f"Режим: {args.mode}")
-        print(f"Репозиторий: {args.repo}")
+        if args.mode == "test":
+            print(f"Тестовый репозиторий: {args.repo}")
+        else:
+            print(f"Источник: crates.io API")
         print(f"Максимальная глубина: {args.depth}")
 
-        # Строим граф
         dg = DependencyGraph(args.mode, args.repo, args.depth)
         dg.build(args.package)
 
-        # Выводим результаты
         print_graph(dg.graph, args.package)
 
-        # Выводим информацию о циклах
         if dg.cycles:
             print(f"\nОбнаружено циклических зависимостей: {len(dg.cycles)}")
             for i, cycle in enumerate(dg.cycles, 1):

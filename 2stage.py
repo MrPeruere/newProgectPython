@@ -1,70 +1,58 @@
 import sys
 import argparse
 import urllib.request
-import re
+import json
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Инструмент визуализации графа зависимостей (Этап 2)")
     parser.add_argument("--package", "-p", required=True, help="Имя анализируемого пакета")
-    parser.add_argument("--repo", "-r", required=True, help="URL репозитория")
     return parser.parse_args()
 
 
-def get_cargo_toml(repo_url, package_name):
-    """Получить содержимое Cargo.toml из репозитория"""
-    # Преобразуем URL GitHub в raw URL
-    if "github.com" in repo_url:
-        repo_url = repo_url.rstrip("/")
-        raw_url = repo_url.replace("github.com", "raw.githubusercontent.com")
-        raw_url = raw_url.replace("/tree/", "/")
+def get_dependencies_from_crates_io(package_name):
+    """Получить зависимости пакета через crates.io API"""
+    versions_url = f"https://crates.io/api/v1/crates/{package_name}/versions"
 
-        # стратегия перебора возможных путей к файлу Cargo.toml
-        urls = [
-            f"{raw_url}/main/Cargo.toml",
-            f"{raw_url}/master/Cargo.toml",
-            f"{repo_url.replace('github.com', 'raw.githubusercontent.com')}/HEAD/Cargo.toml"
-        ]
+    try:
+        req = urllib.request.Request(versions_url)
+        req.add_header('User-Agent', 'dependency-visualizer')
 
-        # Отправляет HTTP GET запрос по указанному URL и возвращает объект ответа
-        for url in urls:
-            try:
-                with urllib.request.urlopen(url) as response:
-                    return response.read().decode('utf-8')
-            except:
-                continue
+        with urllib.request.urlopen(req) as response:
+            data = json.loads(response.read().decode('utf-8'))
 
-    raise Exception("Не удалось получить Cargo.toml из репозитория")
+        # Получаем последнюю версию пакета
+        versions = data.get('versions', [])
+        if not versions:
+            return []
 
+        # Берем первую версию (самая новая)
+        latest_version = versions[0]
+        version_num = latest_version['num']
 
-def parse_dependencies(cargo_toml_content):
-    """Извлечь зависимости из Cargo.toml"""
-    dependencies = [] # список где мы храним зависимости
-    in_dependencies = False
+        # Получаем зависимости конкретной версии
+        deps_url = f"https://crates.io/api/v1/crates/{package_name}/{version_num}/dependencies"
+        req_deps = urllib.request.Request(deps_url)
+        req_deps.add_header('User-Agent', 'dependency-visualizer')
 
-    for line in cargo_toml_content.split('\n'):
-        # убираем пробелы
-        line = line.strip()
+        with urllib.request.urlopen(req_deps) as response:
+            deps_data = json.loads(response.read().decode('utf-8'))
 
-        # Начало секции [dependencies]
-        if line == '[dependencies]':
-            in_dependencies = True
-            continue
+        dependencies = []
+        for dep in deps_data.get('dependencies', []):
+            # Игнорируем dev-зависимости и build-зависимости
+            if dep.get('kind') == 'normal':
+                dependencies.append(dep['crate_id'])
 
-        # Конец секции (новая секция)
-        if line.startswith('[') and in_dependencies:
-            break
+        return dependencies
 
-        # Парсим зависимость
-        if in_dependencies and line and not line.startswith('#'):
-            # match ищет имена пакетов в файле Cargo.toml
-            match = re.match(r'^([a-zA-Z0-9_-]+)\s*=', line)
-            if match:
-                # если match != None то извлекаем имя пакета
-                dep_name = match.group(1)
-                dependencies.append(dep_name)
-
-    return dependencies
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            raise Exception(f"Пакет '{package_name}' не найден на crates.io")
+        else:
+            raise Exception(f"HTTP ошибка: {e.code}")
+    except Exception as e:
+        raise Exception(f"Ошибка при получении данных: {e}")
 
 
 def main():
@@ -72,13 +60,10 @@ def main():
         args = parse_args()
 
         print(f"Получение зависимостей для пакета: {args.package}")
-        print(f"Репозиторий: {args.repo}\n")
+        print(f"Источник: crates.io API\n")
 
-        # Получаем Cargo.toml
-        cargo_content = get_cargo_toml(args.repo, args.package)
-
-        # Парсим зависимости
-        deps = parse_dependencies(cargo_content)
+        # Получаем зависимости через API
+        deps = get_dependencies_from_crates_io(args.package)
 
         # Выводим результат
         print(f"Прямые зависимости пакета '{args.package}':")
